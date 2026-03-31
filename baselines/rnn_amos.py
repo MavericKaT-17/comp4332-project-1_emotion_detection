@@ -11,14 +11,14 @@ from collections import Counter
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_CLASSES = 7
 VOCAB_SIZE  = 30_000
-EMB_DIM     = 128
-HIDDEN_DIM  = 128
+EMB_DIM     = 200
+HIDDEN_DIM  = 256
 NUM_LAYERS  = 2
 MAX_LEN     = 64
-EPOCHS      = 30
+EPOCHS      = 35
 BATCH_SIZE  = 128
-LR          = 1e-3
-DROPOUT     = 0.3
+LR          = 5e-4
+DROPOUT     = 0.5
 SEED        = 42
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -58,6 +58,20 @@ class TextDataset(Dataset):
         y = int(self.labels[idx]) if self.labels is not None else -1
         return x, y
 
+# ── Attention Mechanism ──────────────────────────────────────────────────────
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        # hidden_dim * 2 because it's bidirectional (forward + backward)
+        self.attention = nn.Linear(hidden_dim * 2, 1)
+    
+    def forward(self, rnn_out):
+        # rnn_out shape: (batch_size, sequence_length, hidden_dim * 2)
+        # Calculate attention weights
+        weights = torch.softmax(self.attention(rnn_out), dim=1)
+        # Apply weights to get context vector
+        context = (rnn_out * weights).sum(dim=1)
+        return context
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 class BiRNN(nn.Module):
@@ -74,14 +88,15 @@ class BiRNN(nn.Module):
             nonlinearity="tanh",
             dropout=dropout if num_layers > 1 else 0.0,
         )
+        self.attention = Attention(hidden_dim)
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, x):
-        emb = self.drop(self.emb(x))              # (B, L, E)
-        _, h_n = self.rnn(emb)                    # h_n: (num_layers*2, B, H)
-        # Last layer's forward & backward final hidden states
-        pooled = torch.cat([h_n[-2], h_n[-1]], dim=-1)  # (B, 2H)
-        return self.fc(self.drop(pooled))
+        emb = self.drop(self.emb(x))              
+        rnn_out, _ = self.rnn(emb)                
+        # Use attention to get weighted context vector
+        context = self.attention(rnn_out)         
+        return self.fc(self.drop(context))       
 
 
 # ── Training helpers ──────────────────────────────────────────────────────────
@@ -111,16 +126,16 @@ def evaluate(model, loader, device):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    train_df = pd.read_csv("data/train.csv")
-    valid_df = pd.read_csv("data/valid.csv")
-    test_df  = pd.read_csv("data/test_no_label.csv")
+    train_df = pd.read_csv("data/train_cleaned.csv")
+    valid_df = pd.read_csv("data/valid_cleaned.csv")
+    test_df  = pd.read_csv("data/test_cleaned.csv")
 
     print("Building vocabulary …")
-    vocab = build_vocab(train_df["text"], VOCAB_SIZE)
+    vocab = build_vocab(train_df["cleaned_text"], VOCAB_SIZE)
 
-    train_ds = TextDataset(train_df["text"], train_df["label"].values, vocab, MAX_LEN)
-    valid_ds = TextDataset(valid_df["text"], valid_df["label"].values, vocab, MAX_LEN)
-    test_ds  = TextDataset(test_df["text"],  None,                     vocab, MAX_LEN)
+    train_ds = TextDataset(train_df["cleaned_text"], train_df["label"].values, vocab, MAX_LEN)
+    valid_ds = TextDataset(valid_df["cleaned_text"], valid_df["label"].values, vocab, MAX_LEN)
+    test_ds  = TextDataset(test_df["cleaned_text"],  None,                     vocab, MAX_LEN)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
     valid_loader = DataLoader(valid_ds, batch_size=512,        shuffle=False, num_workers=0)
@@ -128,13 +143,18 @@ def main():
 
     model     = BiRNN(len(vocab), EMB_DIM, HIDDEN_DIM, NUM_LAYERS,
                       NUM_CLASSES, DROPOUT).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
     criterion = nn.CrossEntropyLoss()
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', patience=3, factor=0.5
+    )
 
     best_f1, best_state = 0.0, None
     for epoch in range(1, EPOCHS + 1):
         loss = train_epoch(model, train_loader, optimizer, criterion, DEVICE)
         val_f1 = evaluate(model, valid_loader, DEVICE)
+        scheduler.step(val_f1)
 
         print(f"Epoch {epoch:02d}/{EPOCHS} | "
               f"loss={loss:.4f} | val Macro-F1={val_f1:.4f}")
