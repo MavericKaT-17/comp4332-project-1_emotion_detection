@@ -87,7 +87,7 @@ def build_vocab(texts, vocab_size: int) -> dict:
 
 
 def encode(text: str, vocab: dict, max_len: int):
-    ids = [vocab.get(t, 1) for t in tokenise(text)[:max_len)]
+    ids = [vocab.get(t, 1) for t in tokenise(text)[:max_len]]
     ids += [0] * (max_len - len(ids))
     return ids
 
